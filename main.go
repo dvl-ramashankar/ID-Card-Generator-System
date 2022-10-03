@@ -35,13 +35,26 @@ func storeData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		http.Error(w, "The uploaded file is too big. Please choose an file that's less than 1MB in size", http.StatusBadRequest)
+		return
+	}
+
+	files := r.MultipartForm.File["file"]
+	reqBody := r.MultipartForm.Value["request"][0]
+	if len(files) > 1 {
+		respondWithError(w, http.StatusBadRequest, "Please upload only One file")
+		return
+	}
+
 	var dataBody entity.Request
-	if err := json.NewDecoder(r.Body).Decode(&dataBody); err != nil {
+
+	if err := json.Unmarshal([]byte(reqBody), &dataBody); err != nil {
 		respondWithError(w, http.StatusBadRequest, "Invalid Request")
 		return
 	}
 
-	if result, err := ser.CreateIdAndStore(dataBody); err != nil {
+	if result, err := ser.CreateIdAndStore(dataBody, files); err != nil {
 		respondWithError(w, http.StatusBadRequest, fmt.Sprintf("%v", err))
 	} else {
 		respondWithJson(w, http.StatusBadRequest, result)

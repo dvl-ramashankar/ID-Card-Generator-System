@@ -4,11 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"mime/multipart"
+	"os"
+	"strings"
 	"time"
 
 	"system/entity"
 
+	"github.com/unidoc/unipdf/v3/common/license"
+	"github.com/unidoc/unipdf/v3/creator"
+	"github.com/unidoc/unipdf/v3/model"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -20,6 +27,10 @@ type Connection struct {
 	Database   string
 	Collection string
 }
+
+const maxUploadSize = 10 * 1024 * 1024 // 10 mb
+const dir = "data/download/"
+const downloadDir = "download/"
 
 var Collection *mongo.Collection
 var ctx = context.TODO()
@@ -36,11 +47,15 @@ func (e *Connection) Connect() {
 		log.Fatal(err)
 	}
 
+	err = license.SetMeteredKey("301d8f2e0d0c5d045070142329639ac70eda204a4ad3039482d1bd6d023a2f9a")
+	if err != nil {
+		log.Fatal(err)
+	}
 	Collection = client.Database(e.Database).Collection(e.Collection)
 }
 
 // ===========================Store data & Return card Id======================================
-func (e *Connection) CreateIdAndStore(dataBody entity.Request) (string, error) {
+func (e *Connection) CreateIdAndStore(dataBody entity.Request, files []*multipart.FileHeader) (string, error) {
 	bool, err := validateByNameAndDob(dataBody)
 	if err != nil {
 		return "", err
@@ -48,19 +63,20 @@ func (e *Connection) CreateIdAndStore(dataBody entity.Request) (string, error) {
 	if !bool {
 		return "", errors.New("User already present")
 	}
-	data, err := fetchDataByActive()
+	file, err := uploadFile(files)
+	data, err := fetchAllData()
 	if err != nil {
 		return "", err
 	}
 	var id int64
-	fmt.Println("Lowest:", data[0].IdCard)
-	fmt.Println("Highest", data[len(data)-1].IdCard)
+	fmt.Println("Lowest ID:", data[0].IdCard)
+	fmt.Println("Highest ID", data[len(data)-1].IdCard)
 	if len(data) != 0 {
 		id = data[len(data)-1].IdCard + 1
 	} else {
 		id = 1
 	}
-	saveData, err := SetValueInModel(dataBody, id)
+	saveData, err := SetValueInModel(dataBody, id, file)
 	if err != nil {
 		return "", errors.New("Unable to parse date")
 	}
@@ -101,16 +117,17 @@ func (e *Connection) FetchDataByIdCard(idStr string) ([]*entity.Data, error) {
 	if err != nil {
 		return finaldata, err
 	}
-	fmt.Println(fetchDataCursor)
+
 	finaldata, err = convertDbResultIntoStruct(fetchDataCursor)
 	if err != nil {
 		return finaldata, err
 	}
-	fmt.Println(finaldata)
+
 	if len(finaldata) == 0 {
 		return finaldata, errors.New("Data not present in db given by Id or it is deactivated")
 	}
-
+	str, err := writeDataIntoPDFTable(finaldata)
+	fmt.Println(str)
 	return finaldata, err
 }
 
@@ -189,7 +206,7 @@ func (e *Connection) DeleteById(idStr string) (string, error) {
 
 //XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 
-func SetValueInModel(req entity.Request, id int64) (entity.Data, error) {
+func SetValueInModel(req entity.Request, id int64, file []string) (entity.Data, error) {
 	var data entity.Data
 	joiningDate, err := convertDate(req.JoiningDate)
 	if err != nil {
@@ -210,10 +227,11 @@ func SetValueInModel(req entity.Request, id int64) (entity.Data, error) {
 	data.BloodGroup = req.BloodGroup
 	data.Active = true
 	data.IdCard = id
+	data.FileLocation = file
 	return data, nil
 }
 
-func fetchDataByActive() ([]*entity.Data, error) {
+func fetchAllData() ([]*entity.Data, error) {
 	var result []*entity.Data
 	filter := bson.D{}
 	sorting := options.Find().SetSort(bson.D{{"id", -1}})
@@ -230,7 +248,7 @@ func fetchDataByActive() ([]*entity.Data, error) {
 }
 
 func convertDate(dateStr string) (time.Time, error) {
-	date, err := time.Parse("2006-01-02", dateStr)
+	date, err := time.Parse("1006-01-02", dateStr)
 	if err != nil {
 		log.Println(err)
 		return date, err
@@ -271,4 +289,146 @@ func convertDbResultIntoStruct(fetchDataCursor *mongo.Cursor) ([]*entity.Data, e
 		finaldata = append(finaldata, &data)
 	}
 	return finaldata, nil
+}
+
+func uploadFile(files []*multipart.FileHeader) ([]string, error) {
+	var fileNames []string
+
+	for _, fileHeader := range files {
+		fileName := fileHeader.Filename
+		fileNames = append(fileNames, dir+fileName)
+		if fileHeader.Size > maxUploadSize {
+			return fileNames, errors.New("The uploaded image is too big: %s. Please use an image less than 1MB in size: " + fileHeader.Filename)
+		}
+
+		file, err := fileHeader.Open()
+		if err != nil {
+			return fileNames, err
+		}
+
+		defer file.Close()
+
+		buff := make([]byte, 512)
+		_, err = file.Read(buff)
+		if err != nil {
+			return fileNames, err
+		}
+
+		_, err = file.Seek(0, io.SeekStart)
+		if err != nil {
+			return fileNames, err
+		}
+
+		err = os.MkdirAll(dir, os.ModePerm)
+		if err != nil {
+			return fileNames, err
+		}
+
+		f, err := os.Create(dir + fileHeader.Filename)
+		if err != nil {
+			return fileNames, err
+		}
+
+		defer f.Close()
+
+		_, err = io.Copy(f, file)
+		if err != nil {
+			return fileNames, err
+		}
+	}
+
+	return fileNames, nil
+}
+
+func writeDataIntoPDFTable(data []*entity.Data) (string, error) {
+	str := "File Download Successfully :" + downloadDir + fmt.Sprintf("%v", data[0].IdCard) + ".pdf"
+	c := creator.New()
+	c.SetPageMargins(20, 20, 20, 20)
+
+	font, err := model.NewStandard14Font(model.HelveticaName)
+	if err != nil {
+		return "", err
+	}
+
+	fontBold, err := model.NewStandard14Font(model.HelveticaBoldName)
+	if err != nil {
+		return "", err
+	}
+
+	if err := basicUsage(c, font, fontBold, data); err != nil {
+		return "", err
+	}
+	err = os.MkdirAll(downloadDir, os.ModePerm)
+	if err != nil {
+		return "", err
+	}
+	err = c.WriteToFile(downloadDir + data[0].Name + fmt.Sprintf("%v", data[0].IdCard) + ".pdf")
+	if err != nil {
+		return "", err
+	}
+	return str, nil
+}
+
+func basicUsage(c *creator.Creator, font, fontBold *model.PdfFont, data []*entity.Data) error {
+	// Create chapter.
+	ch := c.NewChapter("Id Card")
+	ch.SetMargins(100, 0, 50, 0)
+	ch.GetHeading().SetFont(font)
+	ch.GetHeading().SetFontSize(20)
+	ch.GetHeading().SetColor(creator.ColorRGBFrom8bit(72, 86, 95))
+
+	contentAlignH(c, ch, font, fontBold, data)
+
+	if err := c.Draw(ch); err != nil {
+		return err
+	}
+	return nil
+}
+
+func contentAlignH(c *creator.Creator, ch *creator.Chapter, font, fontBold *model.PdfFont, data []*entity.Data) {
+
+	normalFontColorGreen := creator.ColorRGBFrom8bit(4, 79, 3)
+	normalFontSize := 10.0
+	for i := range data {
+
+		img, err := c.NewImageFromFile(data[i].FileLocation[0])
+		if err != nil {
+			log.Println(err)
+		}
+		img.ScaleToHeight(50)
+		img.SetMargins(120, 0, 20, 0)
+		ch.Add(img)
+
+		x := c.NewParagraph("ID" + " :     " + fmt.Sprintf("%v", data[i].IdCard))
+		x.SetFont(font)
+		x.SetFontSize(normalFontSize)
+		x.SetColor(normalFontColorGreen)
+		x.SetMargins(100, 0, 10, 0)
+		ch.Add(x)
+		y := c.NewParagraph("Name" + " :     " + data[i].Name)
+		y.SetFont(font)
+		y.SetFontSize(normalFontSize)
+		y.SetColor(normalFontColorGreen)
+		y.SetMargins(100, 0, 10, 0)
+		ch.Add(y)
+		z := c.NewParagraph("DOB" + " :     " + strings.Trim(data[i].DOB.String(), " 00:00:00 +0000 UTC"))
+		z.SetFont(font)
+		z.SetFontSize(normalFontSize)
+		z.SetColor(normalFontColorGreen)
+		z.SetMargins(100, 0, 10, 0)
+		ch.Add(z)
+		b := c.NewParagraph("Designation" + ":     " + data[i].Designation)
+		b.SetFont(font)
+		b.SetFontSize(normalFontSize)
+		b.SetColor(normalFontColorGreen)
+		b.SetMargins(100, 0, 10, 0)
+		ch.Add(b)
+		a := c.NewParagraph("Blood Group" + ":     " + data[i].BloodGroup)
+		a.SetFont(font)
+		a.SetFontSize(normalFontSize)
+		a.SetColor(normalFontColorGreen)
+		a.SetMargins(100, 0, 10, 0)
+		//		a.SetLineHeight(2)
+		ch.Add(a)
+	}
 }
